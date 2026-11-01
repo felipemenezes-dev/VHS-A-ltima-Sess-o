@@ -1,709 +1,283 @@
 #include "raylib.h"
+#include "world.h"
+#include "collision.h"
+#include "scene_draw.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-#define NUM_DIRECOES 4
-#define NUM_FRAMES 4
-#define NUM_CENARIOS 5
-
-enum Direcao {
-    BAIXO = 0,
-    CIMA,
-    DIREITA,
-    ESQUERDA
-};
-
-enum Cenario {
-    SALAO = 0,
-    BANHEIRO,
-    ESCRITORIO,
-    ESTOQUE,
-    SALA_PROJECAO
-};
-
-static Rectangle CaixaColisaoJohn(Vector2 john, float alturaJohn) {
-    float larguraCaixa = alturaJohn * 0.24f;
-    float alturaCaixa = alturaJohn * 0.12f;
-
-    return (Rectangle) {
-        john.x - larguraCaixa / 2.0f,
-        john.y - alturaCaixa,
-        larguraCaixa,
-        alturaCaixa
-    };
+// Integration based on 0aff630: preserve the group's five rooms, four-direction
+// animation, automatic transitions, F1 mask overlay and coordinate inspection.
+static Texture2D CarregarSprite(const char *path) {
+    Image image = LoadImage(path);
+    Texture2D texture = {0};
+    if (image.data) {
+        ImageAlphaCrop(&image, .05f); // align feet despite different transparent margins
+        texture = LoadTextureFromImage(image);
+        UnloadImage(image);
+        if (texture.id)
+            SetTextureFilter(texture, TEXTURE_FILTER_POINT);
+    }
+    return texture;
 }
-
-static bool ColideComMascara(
-    Image mascara,
-    Rectangle caixa,
-    float larguraTela,
-    float alturaTela
-) {
-    if (mascara.data == NULL ||
-        larguraTela <= 0.0f ||
-        alturaTela <= 0.0f) {
-        return false;
+static void LocalizarAssets(const char *arg0) {
+    if (FileExists("assets/cenarios/salao_principal.png"))
+        return;
+    char path[4096];
+    ssize_t count = readlink("/proc/self/exe", path, sizeof path - 1);
+    if (count > 0)
+        path[count] = '\0';
+    else
+        snprintf(path, sizeof path, "%s", arg0);
+    char *slash = strrchr(path, '/');
+    if (!slash)
+        return;
+    *slash = '\0';
+    if (ChangeDirectory(path) && !FileExists("assets/cenarios/salao_principal.png"))
+        ChangeDirectory("..");
+}
+static void CapturarTela(const char *path) {
+    Image image = LoadImageFromScreen();
+    if (image.data) {
+        ExportImage(image, path);
+        UnloadImage(image);
     }
-
-    float escalaX = (float)mascara.width / larguraTela;
-    float escalaY = (float)mascara.height / alturaTela;
-
-    int xInicial = (int)floorf(caixa.x * escalaX);
-    int yInicial = (int)floorf(caixa.y * escalaY);
-    int xFinal = (int)ceilf((caixa.x + caixa.width) * escalaX);
-    int yFinal = (int)ceilf((caixa.y + caixa.height) * escalaY);
-
-    if (xInicial < 0 ||
-        yInicial < 0 ||
-        xFinal >= mascara.width ||
-        yFinal >= mascara.height) {
-        return true;
-    }
-
-    for (int y = yInicial; y <= yFinal; y++) {
-        for (int x = xInicial; x <= xFinal; x++) {
-            Color pixel = GetImageColor(mascara, x, y);
-
-            if (pixel.a > 0) {
-                return true;
-            }
+}
+static void DesenharDepuracao(int room, Vector2 john, Texture2D mask) {
+    DrawTexture(mask, 0, 0, (Color){125, 255, 150, 210});
+    DrawRectangleLinesEx(feet(john), 2, YELLOW);
+    for (int i = 0; i < doorCount; i++) {
+        const Door *d = &doors[i];
+        if (d->from == room) {
+            DrawRectangleLinesEx(d->area, 3, SKYBLUE);
+            DrawText(TextFormat("P%d -> %s", i, d->label), d->area.x, d->area.y - 22, 20, SKYBLUE);
+            if (d->sealA.x)
+                DrawLineEx(d->sealA, d->sealB, 3, ORANGE);
+        }
+        if (d->to == room) {
+            DrawCircleLines(d->arrival.x, d->arrival.y, 18, YELLOW);
+            DrawText(TextFormat("Entrada %d", i), d->arrival.x + 22, d->arrival.y - 10, 19, YELLOW);
         }
     }
-
-    return false;
+    DrawRectangle(20, 90, 440, 96, (Color){6, 8, 14, 230});
+    DrawText("F1 - DEPURACAO", 34, 102, 22, YELLOW);
+    DrawText(TextFormat("Pes: %.1f, %.1f | %.1f x %.1f", john.x, john.y, FOOT_W, FOOT_H), 34, 135, 19,
+             RAYWHITE);
+    DrawText("Azul: transicao | Amarelo: entrada", 34, 162, 18, SKYBLUE);
 }
-
-int main(void) {
-    SetConfigFlags(FLAG_FULLSCREEN_MODE);
-
-    int monitor = GetCurrentMonitor();
-
-    InitWindow(
-        GetMonitorWidth(monitor),
-        GetMonitorHeight(monitor),
-        "VHS - A Ultima Sessao"
-    );
-
+int main(int argc, char **argv) {
+    int larguraInicial = 1280, alturaInicial = 720, limiteQuadros = 0;
+    bool telaCheia = false;
+    const char *captura = NULL, *galeria = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--fullscreen"))
+            telaCheia = true;
+        else if (!strcmp(argv[i], "--size") && i + 2 < argc) {
+            larguraInicial = atoi(argv[++i]);
+            alturaInicial = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--frames") && i + 1 < argc)
+            limiteQuadros = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--capture") && i + 1 < argc)
+            captura = argv[++i];
+        else if (!strcmp(argv[i], "--gallery") && i + 1 < argc)
+            galeria = argv[++i];
+        else {
+            fprintf(
+                stderr,
+                "Uso: %s [--fullscreen] [--size L A] [--frames N --capture arquivo.png] [--gallery pasta]\n",
+                argv[0]);
+            return 2;
+        }
+    }
+    if (larguraInicial < 640 || alturaInicial < 360 || larguraInicial > 7680 || alturaInicial > 4320) {
+        fprintf(stderr, "Resolucao invalida (minimo 640 x 360).\n");
+        return 2;
+    }
+    LocalizarAssets(argv[0]);
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
+    InitWindow(larguraInicial, alturaInicial, "VHS - A Ultima Sessao");
+    if (!IsWindowReady())
+        return 1;
+    SetWindowMinSize(640, 360);
+    if (telaCheia)
+        ToggleBorderlessWindowed();
     SetTargetFPS(60);
 
-    const char *caminhosCenarios[NUM_CENARIOS] = {
-        "assets/cenarios/salao_principal.png",
-        "assets/cenarios/banheiro.png",
-        "assets/cenarios/escritorio.png",
-        "assets/cenarios/estoque.png",
-        "assets/cenarios/sala_projecao.png"
-    };
-
-    Texture2D cenarios[NUM_CENARIOS] = {0};
-
-    const char *pastas[NUM_DIRECOES] = {
-        "baixo",
-        "cima",
-        "direita",
-        "esquerda"
-    };
-
-    const char *nomes[NUM_DIRECOES] = {
-        "baixo",
-        "cima",
-        "direita",
-        "esquerda"
-    };
-
+    Texture2D cenarios[NUM_CENARIOS] = {0}, texturasMascaras[NUM_CENARIOS] = {0};
+    CollisionMap mascaras[NUM_CENARIOS] = {0};
     Texture2D animacoes[NUM_DIRECOES][NUM_FRAMES] = {0};
     Texture2D johnParado[NUM_DIRECOES] = {0};
-
-    Image mascaraSalao = {0};
-    Image mascaraBanheiro = {0};
-
-    Texture2D texturaMascaraSalao = {0};
-    Texture2D texturaMascaraBanheiro = {0};
-
+    const char *pastas[NUM_DIRECOES] = {"baixo", "cima", "direita", "esquerda"};
     bool erro = false;
-
     for (int i = 0; i < NUM_CENARIOS; i++) {
-        cenarios[i] = LoadTexture(caminhosCenarios[i]);
-
-        if (cenarios[i].id == 0) {
-            TraceLog(
-                LOG_ERROR,
-                "Nao foi possivel carregar: %s",
-                caminhosCenarios[i]
-            );
-
+        cenarios[i] = LoadTexture(rooms[i].image);
+        texturasMascaras[i] = LoadTexture(rooms[i].mask);
+        if (!cenarios[i].id || cenarios[i].width != WORLD_W || cenarios[i].height != WORLD_H ||
+            !texturasMascaras[i].id || !collisionLoadRoom(&mascaras[i], i)) {
+            TraceLog(LOG_ERROR, "Cenario/mascara ausente ou invalido: %s", rooms[i].name);
             erro = true;
         } else {
             SetTextureFilter(cenarios[i], TEXTURE_FILTER_POINT);
+            SetTextureFilter(texturasMascaras[i], TEXTURE_FILTER_POINT);
         }
     }
-
-    mascaraSalao = LoadImage("assets/cenarios/colisoes_salao.png");
-
-    if (mascaraSalao.data == NULL) {
-        TraceLog(
-            LOG_ERROR,
-            "Nao foi possivel carregar: assets/cenarios/colisoes_salao.png"
-        );
-
-        erro = true;
-    } else {
-        texturaMascaraSalao = LoadTextureFromImage(mascaraSalao);
-
-        if (texturaMascaraSalao.id == 0) {
-            TraceLog(
-                LOG_ERROR,
-                "Nao foi possivel criar a visualizacao da mascara do salao"
-            );
-
-            erro = true;
-        } else {
-            SetTextureFilter(texturaMascaraSalao, TEXTURE_FILTER_POINT);
-        }
-    }
-
-    mascaraBanheiro = LoadImage("assets/cenarios/colisoes_banheiro.png");
-
-    if (mascaraBanheiro.data == NULL) {
-        TraceLog(
-            LOG_ERROR,
-            "Nao foi possivel carregar: assets/cenarios/colisoes_banheiro.png"
-        );
-
-        erro = true;
-    } else {
-        texturaMascaraBanheiro = LoadTextureFromImage(mascaraBanheiro);
-
-        if (texturaMascaraBanheiro.id == 0) {
-            TraceLog(
-                LOG_ERROR,
-                "Nao foi possivel criar a visualizacao da mascara do banheiro"
-            );
-
-            erro = true;
-        } else {
-            SetTextureFilter(texturaMascaraBanheiro, TEXTURE_FILTER_POINT);
-        }
-    }
-
     for (int d = 0; d < NUM_DIRECOES; d++) {
         char caminho[256];
-
-        snprintf(
-            caminho,
-            sizeof(caminho),
-            "assets/personagens/john/%s/john_parado_%s.png",
-            pastas[d],
-            nomes[d]
-        );
-
-        johnParado[d] = LoadTexture(caminho);
-
-        if (johnParado[d].id == 0) {
-            TraceLog(LOG_ERROR, "Nao foi possivel carregar: %s", caminho);
+        snprintf(caminho, sizeof caminho, "assets/personagens/john/%s/john_parado_%s.png", pastas[d],
+                 pastas[d]);
+        johnParado[d] = CarregarSprite(caminho);
+        if (!johnParado[d].id)
             erro = true;
-        } else {
-            SetTextureFilter(johnParado[d], TEXTURE_FILTER_POINT);
-        }
-
         for (int f = 0; f < NUM_FRAMES; f++) {
-            snprintf(
-                caminho,
-                sizeof(caminho),
-                "assets/personagens/john/%s/john_andando_%s%d.png",
-                pastas[d],
-                nomes[d],
-                f + 1
-            );
-
-            animacoes[d][f] = LoadTexture(caminho);
-
-            if (animacoes[d][f].id == 0) {
-                TraceLog(LOG_ERROR, "Nao foi possivel carregar: %s", caminho);
+            snprintf(caminho, sizeof caminho, "assets/personagens/john/%s/john_andando_%s%d.png", pastas[d],
+                     pastas[d], f + 1);
+            animacoes[d][f] = CarregarSprite(caminho);
+            if (!animacoes[d][f].id)
                 erro = true;
-            } else {
-                SetTextureFilter(animacoes[d][f], TEXTURE_FILTER_POINT);
-            }
         }
     }
-
-    if (erro) {
-        for (int i = 0; i < NUM_CENARIOS; i++) {
-            if (cenarios[i].id != 0) {
-                UnloadTexture(cenarios[i]);
-            }
+    for (int i = 0; i < NUM_CENARIOS && !erro; i++) {
+        if (collisionFeet(&mascaras[i], rooms[i].entry)) {
+            TraceLog(LOG_ERROR, "Entrada bloqueada: %s", rooms[i].name);
+            erro = true;
         }
-
-        for (int d = 0; d < NUM_DIRECOES; d++) {
-            if (johnParado[d].id != 0) {
-                UnloadTexture(johnParado[d]);
-            }
-
-            for (int f = 0; f < NUM_FRAMES; f++) {
-                if (animacoes[d][f].id != 0) {
-                    UnloadTexture(animacoes[d][f]);
-                }
-            }
+    }
+    for (int i = 0; i < doorCount && !erro; i++) {
+        if (collisionFeet(&mascaras[doors[i].to], doors[i].arrival)) {
+            TraceLog(LOG_ERROR, "Destino da porta %d bloqueado", i);
+            erro = true;
         }
-
-        if (texturaMascaraSalao.id != 0) {
-            UnloadTexture(texturaMascaraSalao);
-        }
-
-        if (texturaMascaraBanheiro.id != 0) {
-            UnloadTexture(texturaMascaraBanheiro);
-        }
-
-        if (mascaraSalao.data != NULL) {
-            UnloadImage(mascaraSalao);
-        }
-
-        if (mascaraBanheiro.data != NULL) {
-            UnloadImage(mascaraBanheiro);
-        }
-
-        CloseWindow();
-        return 1;
+    }
+    RenderTexture2D quadro = {0};
+    if (!erro) {
+        quadro = LoadRenderTexture(WORLD_W, WORLD_H);
+        if (!quadro.id)
+            erro = true;
+        else
+            SetTextureFilter(quadro.texture, TEXTURE_FILTER_BILINEAR);
     }
 
-    float larguraTela = (float)GetScreenWidth();
-    float alturaTela = (float)GetScreenHeight();
-
-    Vector2 john = {
-        larguraTela * 0.50f,
-        alturaTela * 0.62f
-    };
-
-    float velocidade = alturaTela * 0.35f;
-
-    int cenarioAtual = SALAO;
-    int direcao = BAIXO;
-    int frameAtual = 0;
-
-    float tempoAnimacao = 0.0f;
-    float duracaoFrame = 0.11f;
-
+    Vector2 john = rooms[SALAO].entry;
+    int cenarioAtual = SALAO, direcao = BAIXO, frameAtual = 0;
+    float tempoAnimacao = 0, duracaoFrame = .11f, esperaTransicao = 0, fade = 0;
     bool mostrarColisoes = false;
-
-    while (!WindowShouldClose()) {
-        float delta = GetFrameTime();
-
-        larguraTela = (float)GetScreenWidth();
-        alturaTela = (float)GetScreenHeight();
-
-        float alturaJohn = alturaTela * 0.15f;
-        Vector2 mouse = GetMousePosition();
-
-        float movimentoX = 0.0f;
-        float movimentoY = 0.0f;
-
-        if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT)) {
-            movimentoX -= 1.0f;
+    int quadroAtual = 0, indiceGaleria = 0;
+    while (!erro && !WindowShouldClose()) {
+        float delta = fminf(GetFrameTime(), .25f);
+        esperaTransicao = fmaxf(0, esperaTransicao - delta);
+        fade = fmaxf(0, fade - delta);
+        Vector2 movimento = {0};
+        if (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT))
+            movimento.x -= 1;
+        if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT))
+            movimento.x += 1;
+        if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP))
+            movimento.y -= 1;
+        if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN))
+            movimento.y += 1;
+        bool andando = false, mudouCenario = false;
+        if (movimento.x || movimento.y) {
+            if (fabsf(movimento.y) > fabsf(movimento.x))
+                direcao = movimento.y < 0 ? CIMA : BAIXO;
+            else
+                direcao = movimento.x < 0 ? ESQUERDA : DIREITA;
+            float comprimento = hypotf(movimento.x, movimento.y);
+            movimento.x /= comprimento;
+            movimento.y /= comprimento;
+            Vector2 anterior = john;
+            john =
+                collisionMove(&mascaras[cenarioAtual], john,
+                              (Vector2){movimento.x * JOHN_SPEED * delta, movimento.y * JOHN_SPEED * delta});
+            andando = hypotf(john.x - anterior.x, john.y - anterior.y) > .01f;
+            mudouCenario = worldTransition(&cenarioAtual, &john, &direcao, movimento, &esperaTransicao);
+            if (mudouCenario) {
+                fade = .14f;
+                andando = false;
+                TraceLog(LOG_INFO, "Passagem: %s | entrada %.0f, %.0f", rooms[cenarioAtual].name, john.x,
+                         john.y);
+            }
         }
-
-        if (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT)) {
-            movimentoX += 1.0f;
-        }
-
-        if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP)) {
-            movimentoY -= 1.0f;
-        }
-
-        if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN)) {
-            movimentoY += 1.0f;
-        }
-
-        bool andando = movimentoX != 0.0f || movimentoY != 0.0f;
-
         if (andando) {
-            if (fabsf(movimentoY) > fabsf(movimentoX)) {
-                direcao = movimentoY < 0.0f ? CIMA : BAIXO;
-            } else {
-                direcao = movimentoX > 0.0f ? DIREITA : ESQUERDA;
-            }
-
-            float comprimento = sqrtf(
-                movimentoX * movimentoX +
-                movimentoY * movimentoY
-            );
-
-            movimentoX /= comprimento;
-            movimentoY /= comprimento;
-
-            float deslocamentoX = movimentoX * velocidade * delta;
-            float deslocamentoY = movimentoY * velocidade * delta;
-
-            if (cenarioAtual == SALAO || cenarioAtual == BANHEIRO) {
-                Image mascaraAtual = (cenarioAtual == SALAO)
-                    ? mascaraSalao
-                    : mascaraBanheiro;
-
-                john.x += deslocamentoX;
-
-                if (ColideComMascara(
-                    mascaraAtual,
-                    CaixaColisaoJohn(john, alturaJohn),
-                    larguraTela,
-                    alturaTela
-                )) {
-                    john.x -= deslocamentoX;
-                }
-
-                john.y += deslocamentoY;
-
-                if (ColideComMascara(
-                    mascaraAtual,
-                    CaixaColisaoJohn(john, alturaJohn),
-                    larguraTela,
-                    alturaTela
-                )) {
-                    john.y -= deslocamentoY;
-                }
-            } else {
-                john.x += deslocamentoX;
-                john.y += deslocamentoY;
-            }
-
             tempoAnimacao += delta;
-
             while (tempoAnimacao >= duracaoFrame) {
                 tempoAnimacao -= duracaoFrame;
                 frameAtual = (frameAtual + 1) % NUM_FRAMES;
             }
         } else {
             frameAtual = 0;
-            tempoAnimacao = 0.0f;
+            tempoAnimacao = 0;
         }
-
-        if (IsKeyPressed(KEY_F1)) {
+        if (IsKeyPressed(KEY_F1))
             mostrarColisoes = !mostrarColisoes;
-        }
-
-        if (
-            mostrarColisoes &&
-            (cenarioAtual == SALAO || cenarioAtual == BANHEIRO) &&
-            IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
-        ) {
-            printf(
-                "Ponto: X = %.2f%%, Y = %.2f%% | Pixel: %.0f, %.0f\n",
-                mouse.x / larguraTela * 100.0f,
-                mouse.y / alturaTela * 100.0f,
-                mouse.x,
-                mouse.y
-            );
-
+        if (IsKeyPressed(KEY_F11))
+            ToggleBorderlessWindowed();
+        if (mostrarColisoes && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            Vector2 p = screenToWorld(GetMousePosition(), viewport(GetScreenWidth(), GetScreenHeight()));
+            printf("Ponto: X = %.2f%%, Y = %.2f%% | Imagem: %.0f, %.0f\n", 100 * p.x / WORLD_W,
+                   100 * p.y / WORLD_H, p.x, p.y);
             fflush(stdout);
         }
-
-        bool mudouCenario = false;
-
-        if (cenarioAtual == SALAO) {
-            Rectangle portaBanheiro = {
-                0.0f,
-                alturaTela * 0.35f,
-                larguraTela * 0.055f,
-                alturaTela * 0.29f
-            };
-
-            Rectangle portaEscritorio = {
-                larguraTela * 0.255f,
-                alturaTela * 0.045f,
-                larguraTela * 0.095f,
-                alturaTela * 0.16f
-            };
-
-            Rectangle portaEstoque = {
-                larguraTela * 0.655f,
-                alturaTela * 0.045f,
-                larguraTela * 0.095f,
-                alturaTela * 0.16f
-            };
-
-            if (
-                movimentoX < 0.0f &&
-                CheckCollisionPointRec(john, portaBanheiro)
-            ) {
-                cenarioAtual = BANHEIRO;
-
-                john.x = larguraTela * 0.855f;
-                john.y = alturaTela * 0.68f;
-
-                direcao = ESQUERDA;
-                frameAtual = 0;
-                tempoAnimacao = 0.0f;
-
-                mudouCenario = true;
-            } else if (CheckCollisionPointRec(john, portaEscritorio)) {
-                cenarioAtual = ESCRITORIO;
-
-                john.x = larguraTela * 0.50f;
-                john.y = alturaTela * 0.73f;
-
-                direcao = CIMA;
-                frameAtual = 0;
-                tempoAnimacao = 0.0f;
-
-                mudouCenario = true;
-            } else if (CheckCollisionPointRec(john, portaEstoque)) {
-                cenarioAtual = ESTOQUE;
-
-                john.x = larguraTela * 0.50f;
-                john.y = alturaTela * 0.73f;
-
-                direcao = CIMA;
-                frameAtual = 0;
-                tempoAnimacao = 0.0f;
-
-                mudouCenario = true;
-            }
-        } else if (cenarioAtual == BANHEIRO) {
-            Rectangle saidaBanheiro = {
-                larguraTela * 0.89f,
-                alturaTela * 0.50f,
-                larguraTela * 0.11f,
-                alturaTela * 0.25f
-            };
-
-            if (
-                movimentoX > 0.0f &&
-                CheckCollisionPointRec(john, saidaBanheiro)
-            ) {
-                cenarioAtual = SALAO;
-
-                john.x = larguraTela * 0.06f;
-                john.y = alturaTela * 0.53f;
-
-                direcao = DIREITA;
-                frameAtual = 0;
-                tempoAnimacao = 0.0f;
-
-                mudouCenario = true;
-            }
-        } else {
-            if (cenarioAtual == ESTOQUE) {
-                Rectangle portaProjecao = {
-                    larguraTela * 0.44f,
-                    alturaTela * 0.03f,
-                    larguraTela * 0.12f,
-                    alturaTela * 0.21f
-                };
-
-                if (
-                    movimentoY < 0.0f &&
-                    CheckCollisionPointRec(john, portaProjecao)
-                ) {
-                    cenarioAtual = SALA_PROJECAO;
-
-                    john.x = larguraTela * 0.50f;
-                    john.y = alturaTela * 0.73f;
-
-                    direcao = CIMA;
-                    frameAtual = 0;
-                    tempoAnimacao = 0.0f;
-
-                    mudouCenario = true;
-                }
-            }
-
-            Rectangle saidaComodo = {
-                larguraTela * 0.38f,
-                alturaTela * 0.86f,
-                larguraTela * 0.24f,
-                alturaTela * 0.13f
-            };
-
-            if (CheckCollisionPointRec(john, saidaComodo)) {
-                int comodoAnterior = cenarioAtual;
-
-                if (comodoAnterior == SALA_PROJECAO) {
-                    cenarioAtual = ESTOQUE;
-
-                    john.x = larguraTela * 0.50f;
-                    john.y = alturaTela * 0.23f;
-                } else {
-                    cenarioAtual = SALAO;
-
-                    if (comodoAnterior == ESCRITORIO) {
-                        john.x = larguraTela * 0.30f;
-                        john.y = alturaTela * 0.23f;
-                    } else if (comodoAnterior == ESTOQUE) {
-                        john.x = larguraTela * 0.70f;
-                        john.y = alturaTela * 0.23f;
-                    }
-                }
-
-                direcao = BAIXO;
-                frameAtual = 0;
-                tempoAnimacao = 0.0f;
-
-                mudouCenario = true;
-            }
+        if (galeria) {
+            cenarioAtual = indiceGaleria / 2;
+            john = rooms[cenarioAtual].entry;
+            mostrarColisoes = indiceGaleria % 2;
+            direcao = BAIXO;
+            andando = false;
+            fade = 0;
         }
-
-        Texture2D atual;
-
-        if (andando && !mudouCenario) {
-            atual = animacoes[direcao][frameAtual];
-        } else {
-            atual = johnParado[direcao];
-        }
-
-        float proporcao = (float)atual.width / (float)atual.height;
-        float larguraJohn = alturaJohn * proporcao;
-
-        if (john.x < larguraJohn / 2.0f) {
-            john.x = larguraJohn / 2.0f;
-        }
-
-        if (john.x > larguraTela - larguraJohn / 2.0f) {
-            john.x = larguraTela - larguraJohn / 2.0f;
-        }
-
-        if (john.y < alturaJohn) {
-            john.y = alturaJohn;
-        }
-
-        if (john.y > alturaTela - 10.0f) {
-            john.y = alturaTela - 10.0f;
-        }
-
+        Texture2D atual = andando && !mudouCenario ? animacoes[direcao][frameAtual] : johnParado[direcao];
+        BeginTextureMode(quadro);
+        ClearBackground(BLACK);
+        DrawTexture(cenarios[cenarioAtual], 0, 0, WHITE);
+        sceneDrawJohn(cenarios[cenarioAtual], atual, cenarioAtual, john);
+        if (fade > 0)
+            DrawRectangle(0, 0, WORLD_W, WORLD_H, Fade(BLACK, fade * 2));
+        if (mostrarColisoes)
+            DesenharDepuracao(cenarioAtual, john, texturasMascaras[cenarioAtual]);
+        DrawRectangle(18, 16, 270, 34, (Color){6, 8, 14, 195});
+        DrawText(rooms[cenarioAtual].name, 30, 24, 20, RAYWHITE);
+        DrawRectangle(0, WORLD_H - 29, WORLD_W, 29, (Color){6, 8, 14, 195});
+        DrawText("WASD / SETAS: mover e atravessar portas     F1: colisoes     F11: tela cheia     ESC: sair",
+                 24, WORLD_H - 22, 17, LIGHTGRAY);
+        EndTextureMode();
         BeginDrawing();
         ClearBackground(BLACK);
-
-        DrawTexturePro(
-            cenarios[cenarioAtual],
-            (Rectangle) {
-                0.0f,
-                0.0f,
-                (float)cenarios[cenarioAtual].width,
-                (float)cenarios[cenarioAtual].height
-            },
-            (Rectangle) {
-                0.0f,
-                0.0f,
-                larguraTela,
-                alturaTela
-            },
-            (Vector2) {0.0f, 0.0f},
-            0.0f,
-            WHITE
-        );
-
-        if (
-            mostrarColisoes &&
-            (cenarioAtual == SALAO || cenarioAtual == BANHEIRO)
-        ) {
-            Texture2D texturaMascaraAtual = (cenarioAtual == SALAO)
-                ? texturaMascaraSalao
-                : texturaMascaraBanheiro;
-
-            DrawTexturePro(
-                texturaMascaraAtual,
-                (Rectangle) {
-                    0.0f,
-                    0.0f,
-                    (float)texturaMascaraAtual.width,
-                    (float)texturaMascaraAtual.height
-                },
-                (Rectangle) {
-                    0.0f,
-                    0.0f,
-                    larguraTela,
-                    alturaTela
-                },
-                (Vector2) {0.0f, 0.0f},
-                0.0f,
-                (Color){26, 214, 123, 220}
-            );
-        }
-
-        DrawTexturePro(
-            atual,
-            (Rectangle) {
-                0.0f,
-                0.0f,
-                (float)atual.width,
-                (float)atual.height
-            },
-            (Rectangle) {
-                john.x - larguraJohn / 2.0f,
-                john.y - alturaJohn,
-                larguraJohn,
-                alturaJohn
-            },
-            (Vector2) {0.0f, 0.0f},
-            0.0f,
-            WHITE
-        );
-
-        if (
-            mostrarColisoes &&
-            (cenarioAtual == SALAO || cenarioAtual == BANHEIRO)
-        ) {
-            Rectangle caixaJohn = CaixaColisaoJohn(john, alturaJohn);
-
-            DrawRectangleRec(
-                caixaJohn,
-                (Color){0, 220, 255, 90}
-            );
-
-            DrawRectangleLinesEx(
-                caixaJohn,
-                2.0f,
-                SKYBLUE
-            );
-
-            char infoMouse[160];
-
-            snprintf(
-                infoMouse,
-                sizeof(infoMouse),
-                "Mouse: X %.2f%% | Y %.2f%%",
-                mouse.x / larguraTela * 100.0f,
-                mouse.y / alturaTela * 100.0f
-            );
-
-            DrawRectangle(10, 10, 490, 62, (Color){0, 0, 0, 190});
-
-            DrawText(
-                infoMouse,
-                20,
-                18,
-                20,
-                YELLOW
-            );
-
-            DrawText(
-                "F1: ocultar colisao | Clique: registrar ponto no terminal",
-                20,
-                44,
-                16,
-                RAYWHITE
-            );
-
-            DrawCircleV(mouse, 5.0f, YELLOW);
-        }
-
+        DrawTexturePro(quadro.texture, (Rectangle){0, 0, WORLD_W, -WORLD_H},
+                       viewport(GetScreenWidth(), GetScreenHeight()), (Vector2){0, 0}, 0, WHITE);
         EndDrawing();
-    }
-
-    for (int i = 0; i < NUM_CENARIOS; i++) {
-        UnloadTexture(cenarios[i]);
-    }
-
-    for (int d = 0; d < NUM_DIRECOES; d++) {
-        for (int f = 0; f < NUM_FRAMES; f++) {
-            UnloadTexture(animacoes[d][f]);
+        if (galeria && quadroAtual % 3 == 2) {
+            char path[4096];
+            snprintf(path, sizeof path, "%s/%d-%s.png", galeria, indiceGaleria / 2,
+                     mostrarColisoes ? "debug" : "normal");
+            CapturarTela(path);
+            if (++indiceGaleria == 10)
+                break;
         }
-
-        UnloadTexture(johnParado[d]);
+        quadroAtual++;
+        if (limiteQuadros > 0 && quadroAtual >= limiteQuadros) {
+            if (captura)
+                CapturarTela(captura);
+            break;
+        }
     }
-
-    UnloadTexture(texturaMascaraSalao);
-    UnloadTexture(texturaMascaraBanheiro);
-
-    UnloadImage(mascaraSalao);
-    UnloadImage(mascaraBanheiro);
-
+    if (quadro.id)
+        UnloadRenderTexture(quadro);
+    for (int i = 0; i < NUM_CENARIOS; i++) {
+        if (cenarios[i].id)
+            UnloadTexture(cenarios[i]);
+        if (texturasMascaras[i].id)
+            UnloadTexture(texturasMascaras[i]);
+        collisionFree(&mascaras[i]);
+    }
+    for (int d = 0; d < NUM_DIRECOES; d++) {
+        if (johnParado[d].id)
+            UnloadTexture(johnParado[d]);
+        for (int f = 0; f < NUM_FRAMES; f++)
+            if (animacoes[d][f].id)
+                UnloadTexture(animacoes[d][f]);
+    }
     CloseWindow();
-    return 0;
+    return erro ? 1 : 0;
 }
