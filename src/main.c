@@ -114,7 +114,10 @@ int main(void) {
     Texture2D johnParado[NUM_DIRECOES] = {0};
 
     Image mascaraSalao = {0};
+    Image mascaraBanheiro = {0};
+
     Texture2D texturaMascaraSalao = {0};
+    Texture2D texturaMascaraBanheiro = {0};
 
     bool erro = false;
 
@@ -149,15 +152,36 @@ int main(void) {
         if (texturaMascaraSalao.id == 0) {
             TraceLog(
                 LOG_ERROR,
-                "Nao foi possivel criar a visualizacao da mascara de colisao"
+                "Nao foi possivel criar a visualizacao da mascara do salao"
             );
 
             erro = true;
         } else {
-            SetTextureFilter(
-                texturaMascaraSalao,
-                TEXTURE_FILTER_POINT
+            SetTextureFilter(texturaMascaraSalao, TEXTURE_FILTER_POINT);
+        }
+    }
+
+    mascaraBanheiro = LoadImage("assets/cenarios/colisoes_banheiro.png");
+
+    if (mascaraBanheiro.data == NULL) {
+        TraceLog(
+            LOG_ERROR,
+            "Nao foi possivel carregar: assets/cenarios/colisoes_banheiro.png"
+        );
+
+        erro = true;
+    } else {
+        texturaMascaraBanheiro = LoadTextureFromImage(mascaraBanheiro);
+
+        if (texturaMascaraBanheiro.id == 0) {
+            TraceLog(
+                LOG_ERROR,
+                "Nao foi possivel criar a visualizacao da mascara do banheiro"
             );
+
+            erro = true;
+        } else {
+            SetTextureFilter(texturaMascaraBanheiro, TEXTURE_FILTER_POINT);
         }
     }
 
@@ -225,8 +249,16 @@ int main(void) {
             UnloadTexture(texturaMascaraSalao);
         }
 
+        if (texturaMascaraBanheiro.id != 0) {
+            UnloadTexture(texturaMascaraBanheiro);
+        }
+
         if (mascaraSalao.data != NULL) {
             UnloadImage(mascaraSalao);
+        }
+
+        if (mascaraBanheiro.data != NULL) {
+            UnloadImage(mascaraBanheiro);
         }
 
         CloseWindow();
@@ -249,6 +281,7 @@ int main(void) {
 
     float tempoAnimacao = 0.0f;
     float duracaoFrame = 0.11f;
+
     bool mostrarColisoes = false;
 
     while (!WindowShouldClose()) {
@@ -299,11 +332,15 @@ int main(void) {
             float deslocamentoX = movimentoX * velocidade * delta;
             float deslocamentoY = movimentoY * velocidade * delta;
 
-            if (cenarioAtual == SALAO) {
+            if (cenarioAtual == SALAO || cenarioAtual == BANHEIRO) {
+                Image mascaraAtual = (cenarioAtual == SALAO)
+                    ? mascaraSalao
+                    : mascaraBanheiro;
+
                 john.x += deslocamentoX;
 
                 if (ColideComMascara(
-                    mascaraSalao,
+                    mascaraAtual,
                     CaixaColisaoJohn(john, alturaJohn),
                     larguraTela,
                     alturaTela
@@ -314,7 +351,7 @@ int main(void) {
                 john.y += deslocamentoY;
 
                 if (ColideComMascara(
-                    mascaraSalao,
+                    mascaraAtual,
                     CaixaColisaoJohn(john, alturaJohn),
                     larguraTela,
                     alturaTela
@@ -343,7 +380,7 @@ int main(void) {
 
         if (
             mostrarColisoes &&
-            cenarioAtual == SALAO &&
+            (cenarioAtual == SALAO || cenarioAtual == BANHEIRO) &&
             IsMouseButtonPressed(MOUSE_BUTTON_LEFT)
         ) {
             printf(
@@ -551,14 +588,21 @@ int main(void) {
             WHITE
         );
 
-        if (mostrarColisoes && cenarioAtual == SALAO) {
+        if (
+            mostrarColisoes &&
+            (cenarioAtual == SALAO || cenarioAtual == BANHEIRO)
+        ) {
+            Texture2D texturaMascaraAtual = (cenarioAtual == SALAO)
+                ? texturaMascaraSalao
+                : texturaMascaraBanheiro;
+
             DrawTexturePro(
-                texturaMascaraSalao,
+                texturaMascaraAtual,
                 (Rectangle) {
                     0.0f,
                     0.0f,
-                    (float)texturaMascaraSalao.width,
-                    (float)texturaMascaraSalao.height
+                    (float)texturaMascaraAtual.width,
+                    (float)texturaMascaraAtual.height
                 },
                 (Rectangle) {
                     0.0f,
@@ -591,7 +635,10 @@ int main(void) {
             WHITE
         );
 
-        if (mostrarColisoes && cenarioAtual == SALAO) {
+        if (
+            mostrarColisoes &&
+            (cenarioAtual == SALAO || cenarioAtual == BANHEIRO)
+        ) {
             Rectangle caixaJohn = CaixaColisaoJohn(john, alturaJohn);
 
             DrawRectangleRec(
@@ -652,7 +699,10 @@ int main(void) {
     }
 
     UnloadTexture(texturaMascaraSalao);
+    UnloadTexture(texturaMascaraBanheiro);
+
     UnloadImage(mascaraSalao);
+    UnloadImage(mascaraBanheiro);
 
     CloseWindow();
     return 0;
